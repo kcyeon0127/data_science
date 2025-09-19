@@ -10,6 +10,7 @@ class CTRDataPreprocessor:
         self.scalers = {}
         self.encoders = {}
         self.feature_stats = {}
+        self.categorical_values = {}  # 전체 데이터의 카테고리 값들을 저장
 
     def load_data(self, train_path, test_path=None):
         """Load train and test data"""
@@ -21,6 +22,53 @@ class CTRDataPreprocessor:
         if test_path:
             print(f"Test shape: {self.test_df.shape}")
         return self
+
+    def scan_categorical_values(self, file_path, chunk_size=50000):
+        """전체 데이터를 스캔하여 모든 카테고리 값들을 미리 파악"""
+        print(f"전체 데이터 카테고리 스캔 중... (청크 크기: {chunk_size:,})")
+
+        categorical_cols = ['gender', 'age_group', 'inventory_id', 'l_feat_14']
+
+        # 각 카테고리별 고유값 저장용 set
+        for col in categorical_cols:
+            self.categorical_values[col] = set()
+
+        try:
+            # 전체 데이터를 청크별로 읽어서 카테고리 수집
+            df_full = pd.read_parquet(file_path)
+            total_rows = len(df_full)
+
+            from tqdm.auto import tqdm
+
+            with tqdm(total=(total_rows // chunk_size) + 1, desc="카테고리 스캔") as pbar:
+                for start_idx in range(0, total_rows, chunk_size):
+                    end_idx = min(start_idx + chunk_size, total_rows)
+                    chunk = df_full.iloc[start_idx:end_idx]
+
+                    for col in categorical_cols:
+                        if col in chunk.columns:
+                            # NaN 제외하고 문자열로 변환하여 고유값 수집
+                            unique_vals = chunk[col].dropna().astype(str).unique()
+                            self.categorical_values[col].update(unique_vals)
+
+                    pbar.set_postfix_str(f"처리: {end_idx:,}/{total_rows:,}")
+                    pbar.update(1)
+
+            # 수집 결과 출력
+            print("\n카테고리 스캔 결과:")
+            for col in categorical_cols:
+                if col in self.categorical_values:
+                    print(f"  {col}: {len(self.categorical_values[col]):,}개 고유값")
+
+            del df_full  # 메모리 해제
+            import gc
+            gc.collect()
+
+            return True
+
+        except Exception as e:
+            print(f"카테고리 스캔 중 오류: {e}")
+            return False
 
     def handle_missing_values(self, df):
         """Handle missing values based on EDA findings"""
@@ -104,17 +152,76 @@ class CTRDataPreprocessor:
         return df
 
     def encode_categorical_features(self, df, is_training=True):
-        """Encode categorical features"""
+        """Encode categorical features - One-Hot for low cardinality, LabelEncoder for high cardinality"""
         df = df.copy()
 
-        categorical_cols = ['gender', 'age_group', 'inventory_id', 'l_feat_14',
-                          'seq_length_bin', 'gender_age_interaction']
+        # One-Hot Encoding을 사용할 저카디널리티 변수들 (명목형)
+        onehot_cols = ['gender', 'age_group']
 
-        for col in categorical_cols:
+        # LabelEncoder를 사용할 고카디널리티 변수들
+        label_encoder_cols = ['inventory_id', 'l_feat_14', 'seq_length_bin', 'gender_age_interaction']
+
+        # 1. One-Hot Encoding 처리
+        for col in onehot_cols:
+            if col in df.columns:
+                if is_training:
+                    # 스캔된 카테고리 값들 사용
+                    if col in self.categorical_values and self.categorical_values[col]:
+                        all_categories = sorted(list(self.categorical_values[col])) + ['unknown']
+                    else:
+                        all_categories = sorted(df[col].astype(str).unique().tolist()) + ['unknown']
+
+                    # 카테고리 정보 저장
+                    self.encoders[f'{col}_categories'] = all_categories
+                    print(f"  {col}: One-Hot Encoding ({len(all_categories)}개 카테고리)")
+
+                # One-Hot Encoding 적용
+                categories = self.encoders.get(f'{col}_categories', ['unknown'])
+
+                # 미지의 카테고리를 'unknown'으로 변환
+                df[col] = df[col].astype(str).apply(
+                    lambda x: x if x in categories else 'unknown'
+                )
+
+                # pandas get_dummies 사용
+                onehot_df = pd.get_dummies(df[col], prefix=col, dtype='int8')
+
+                # 학습 시 없었던 카테고리 컬럼들을 0으로 추가
+                if not is_training:
+                    expected_cols = [f'{col}_{cat}' for cat in categories]
+                    for expected_col in expected_cols:
+                        if expected_col not in onehot_df.columns:
+                            onehot_df[expected_col] = 0
+
+                # 순서 맞추기
+                if not is_training:
+                    expected_cols = [f'{col}_{cat}' for cat in self.encoders[f'{col}_categories']]
+                    onehot_df = onehot_df.reindex(columns=expected_cols, fill_value=0)
+
+                # 원본 컬럼 제거하고 One-Hot 컬럼들 추가
+                df = df.drop(columns=[col])
+                df = pd.concat([df, onehot_df], axis=1)
+
+        # 2. LabelEncoder 처리 (고카디널리티)
+        for col in label_encoder_cols:
             if col in df.columns:
                 if is_training:
                     self.encoders[col] = LabelEncoder()
-                    df[col] = self.encoders[col].fit_transform(df[col].astype(str))
+
+                    # 미리 스캔된 카테고리 값들을 사용하여 인코더 학습
+                    if col in self.categorical_values and self.categorical_values[col]:
+                        # 스캔된 전체 카테고리 + 'unknown' 추가
+                        all_categories = list(self.categorical_values[col]) + ['unknown']
+                        print(f"  {col}: LabelEncoder ({len(all_categories):,}개 카테고리)")
+                        self.encoders[col].fit(all_categories)
+                    else:
+                        # 스캔 결과가 없으면 현재 데이터 + 'unknown'으로 학습
+                        current_categories = df[col].astype(str).unique().tolist() + ['unknown']
+                        self.encoders[col].fit(current_categories)
+
+                    # 현재 데이터 변환
+                    df[col] = self.encoders[col].transform(df[col].astype(str))
+
                 else:
                     if col in self.encoders:
                         # Handle unseen categories

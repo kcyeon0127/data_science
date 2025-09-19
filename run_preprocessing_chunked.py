@@ -13,26 +13,139 @@ from ctr_preprocessing import CTRDataPreprocessor
 from preprocessing_utils import CTRPreprocessingUtils
 
 def process_data_in_chunks(file_path, chunk_size=100000, preprocessor=None, is_training=True, target_col='clicked'):
-    """데이터를 청크 단위로 처리"""
+    """데이터를 청크 단위로 처리 - 메모리 안전한 방식"""
 
-    # 전체 행 수 먼저 확인
-    temp_df = pd.read_parquet(file_path, columns=['clicked'] if 'train' in file_path else [])
-    total_rows = len(temp_df)
-    del temp_df
-    gc.collect()
+    print(f"청크 방식으로 데이터 처리: 청크 크기 {chunk_size:,}행")
+
+    processed_chunks = []
+    chunk_count = 0
+    temp_files = []
+
+    try:
+        # 파일 크기만 먼저 확인 (전체 로드 없이)
+        sample_df = pd.read_parquet(file_path, nrows=1000)
+        file_size = os.path.getsize(file_path)
+        sample_memory = sample_df.memory_usage(deep=True).sum()
+        estimated_rows = int((file_size / sample_memory) * 1000)
+
+        del sample_df
+        gc.collect()
+
+        num_chunks = (estimated_rows // chunk_size) + 1
+        print(f"예상 {estimated_rows:,}행을 {chunk_size:,}개씩 {num_chunks}개 청크로 처리합니다.")
+
+        # 파일을 작은 단위로 읽어가며 처리
+        with tqdm(total=num_chunks, desc=f"청크 처리 ({chunk_size:,}행씩)") as pbar:
+            offset = 0
+
+            while True:
+                try:
+                    # 청크 단위로 읽기
+                    chunk = pd.read_parquet(file_path)
+
+                    # 실제 청크 분할
+                    start_idx = offset
+                    end_idx = min(offset + chunk_size, len(chunk))
+
+                    if start_idx >= len(chunk):
+                        break
+
+                    current_chunk = chunk.iloc[start_idx:end_idx].copy()
+                    del chunk  # 즉시 메모리 해제
+                    gc.collect()
+
+                    chunk_count += 1
+
+                    # 메모리 사용량 모니터링
+                    memory_mb = current_chunk.memory_usage(deep=True).sum() / 1024 / 1024
+                    pbar.set_postfix_str(f"청크 {chunk_count}, 메모리: {memory_mb:.1f}MB")
+
+                    # 전처리 적용
+                    if preprocessor:
+                        chunk_processed = preprocessor.preprocess_pipeline(
+                            current_chunk,
+                            is_training=is_training,
+                            target_col=target_col
+                        )
+                    else:
+                        chunk_processed = current_chunk.copy()
+
+                    # 처리된 청크를 임시 파일로 저장 (메모리 절약)
+                    temp_file = f'temp_chunk_{chunk_count}.parquet'
+                    chunk_processed.to_parquet(temp_file, compression='snappy')
+                    temp_files.append(temp_file)
+
+                    # 메모리 정리
+                    del current_chunk, chunk_processed
+                    gc.collect()
+
+                    offset += chunk_size
+                    pbar.update(1)
+
+                    # 중간 진행 상황 출력
+                    if chunk_count % 10 == 0:
+                        print(f"\n청크 {chunk_count}개 처리 완료, 메모리 정리 중...")
+                        gc.collect()
+
+                except Exception as e:
+                    print(f"\n청크 {chunk_count} 처리 중 오류: {e}")
+                    break
+
+        # 임시 파일들을 다시 로드하여 processed_chunks 생성
+        print(f"\n임시 파일들을 로드 중... ({len(temp_files)}개)")
+        for temp_file in tqdm(temp_files, desc="청크 로드"):
+            try:
+                chunk_data = pd.read_parquet(temp_file)
+                processed_chunks.append(chunk_data)
+            except Exception as e:
+                print(f"임시 파일 {temp_file} 로드 오류: {e}")
+
+        # 임시 파일 정리
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+
+        print(f"총 {len(processed_chunks)}개 청크 처리 완료")
+        return processed_chunks
+
+    except Exception as e:
+        print(f"청크 처리 전체 오류: {e}")
+
+        # 임시 파일 정리
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+
+        return []
+
+def process_data_simple_chunks(file_path, chunk_size, preprocessor, is_training, target_col):
+    """간단한 청크 처리 (PyArrow 없을 때)"""
+    print("간단한 청크 처리 방식을 사용합니다...")
+
+    # 전체 데이터 로드 후 분할
+    print("전체 데이터를 로드합니다...")
+    full_df = pd.read_parquet(file_path)
+    total_rows = len(full_df)
 
     print(f"총 {total_rows:,}행을 {chunk_size:,}개씩 처리합니다.")
 
     processed_chunks = []
+    num_chunks = (total_rows // chunk_size) + (1 if total_rows % chunk_size else 0)
 
-    # 청크별 처리
-    with tqdm(total=total_rows//chunk_size + 1, desc=f"청크 처리 ({chunk_size:,}행씩)") as pbar:
-        for chunk in pd.read_parquet(file_path, chunksize=chunk_size):
-            # 메모리 사용량 모니터링
-            pbar.set_postfix_str(f"메모리: {chunk.memory_usage(deep=True).sum() / 1024 / 1024:.1f}MB")
-
-            # 전처리 적용
+    with tqdm(total=num_chunks, desc=f"청크 처리 ({chunk_size:,}행씩)") as pbar:
+        for i in range(0, total_rows, chunk_size):
             try:
+                end_idx = min(i + chunk_size, total_rows)
+                chunk = full_df.iloc[i:end_idx].copy()
+
+                memory_mb = chunk.memory_usage(deep=True).sum() / 1024 / 1024
+                pbar.set_postfix_str(f"메모리: {memory_mb:.1f}MB, 행: {len(chunk):,}")
+
+                # 전처리 적용
                 if preprocessor:
                     chunk_processed = preprocessor.preprocess_pipeline(
                         chunk,
@@ -45,49 +158,102 @@ def process_data_in_chunks(file_path, chunk_size=100000, preprocessor=None, is_t
                 processed_chunks.append(chunk_processed)
 
             except Exception as e:
-                print(f"청크 처리 중 오류: {e}")
-                # 실패한 청크는 기본 처리만 수행
-                processed_chunks.append(chunk)
+                print(f"청크 {i//chunk_size + 1} 처리 중 오류: {e}")
+                continue
 
             pbar.update(1)
 
             # 메모리 정리
             del chunk
+            if 'chunk_processed' in locals():
+                del chunk_processed
             gc.collect()
+
+    # 원본 데이터프레임 삭제
+    del full_df
+    gc.collect()
 
     return processed_chunks
 
 def combine_chunks_efficiently(chunks, output_path):
-    """청크들을 효율적으로 결합"""
+    """청크들을 배치별로 효율적으로 결합"""
     print(f"청크 결합 중... 총 {len(chunks)}개 청크")
 
-    with tqdm(total=len(chunks), desc="청크 결합") as pbar:
-        # 첫 번째 청크로 시작
-        combined = chunks[0].copy()
-        pbar.update(1)
+    if len(chunks) == 0:
+        raise ValueError("결합할 청크가 없습니다.")
 
-        # 나머지 청크들을 순차적으로 결합
-        for i, chunk in enumerate(chunks[1:], 1):
-            try:
-                combined = pd.concat([combined, chunk], ignore_index=True)
-                pbar.set_postfix_str(f"현재 크기: {len(combined):,}행")
-                pbar.update(1)
+    if len(chunks) == 1:
+        return chunks[0]
+
+    batch_size = 5  # 한번에 5개씩 결합
+    temp_files = []
+
+    try:
+        # 배치별 결합
+        with tqdm(total=(len(chunks) // batch_size) + 1, desc="배치별 결합") as pbar:
+            for i in range(0, len(chunks), batch_size):
+                batch_chunks = chunks[i:i+batch_size]
+
+                pbar.set_postfix_str(f"배치 {i//batch_size + 1}: {len(batch_chunks)}개 청크")
+
+                # 배치 내 청크들 결합
+                if len(batch_chunks) == 1:
+                    batch_combined = batch_chunks[0]
+                else:
+                    batch_combined = pd.concat(batch_chunks, ignore_index=True)
+
+                # 임시 파일로 저장
+                temp_file = output_path.replace('.parquet', f'_batch_{i//batch_size}.parquet')
+                batch_combined.to_parquet(temp_file, compression='snappy')
+                temp_files.append(temp_file)
 
                 # 메모리 정리
-                del chunks[i-1]  # 이미 사용한 청크 삭제
-                if i % 5 == 0:  # 5개마다 가비지 컬렉션
-                    gc.collect()
-
-            except MemoryError:
-                print(f"메모리 부족으로 {i}번째 청크에서 중간 저장합니다.")
-                # 중간 저장
-                temp_path = output_path.replace('.parquet', f'_temp_{i}.parquet')
-                combined.to_parquet(temp_path)
-                del combined
+                del batch_chunks, batch_combined
                 gc.collect()
-                combined = chunk.copy()
 
-    return combined
+                pbar.update(1)
+
+        print(f"\n배치별 결합 완료. {len(temp_files)}개 배치 파일 생성.")
+
+        # 최종 결합
+        print("최종 배치 파일들을 결합 중...")
+        final_chunks = []
+
+        with tqdm(total=len(temp_files), desc="최종 결합") as pbar:
+            for temp_file in temp_files:
+                chunk = pd.read_parquet(temp_file)
+                final_chunks.append(chunk)
+                pbar.set_postfix_str(f"로드: {len(chunk):,}행")
+                pbar.update(1)
+
+        # 최종 결합
+        print("전체 데이터 결합 중...")
+        final_combined = pd.concat(final_chunks, ignore_index=True)
+
+        # 임시 파일 삭제
+        print("임시 파일 정리 중...")
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+
+        print(f"결합 완료! 최종 크기: {final_combined.shape}")
+        return final_combined
+
+    except Exception as e:
+        print(f"청크 결합 중 오류: {e}")
+
+        # 임시 파일 정리
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+
+        # 폴백: 첫 번째 청크만 반환
+        print("폴백: 첫 번째 청크만 사용합니다.")
+        return chunks[0]
 
 def main():
     print("메모리 효율적인 CTR 예측 데이터 전처리 시작...")
@@ -98,16 +264,28 @@ def main():
     available_memory_gb = psutil.virtual_memory().available / (1024**3)
     print(f"사용 가능 메모리: {available_memory_gb:.1f}GB")
 
-    # 메모리에 따른 청크 크기 조정
-    if available_memory_gb < 4:
-        chunk_size = 50000
-        print("⚠️  메모리가 부족합니다. 작은 청크 크기로 처리합니다.")
-    elif available_memory_gb < 8:
-        chunk_size = 100000
-        print("🔧 중간 청크 크기로 처리합니다.")
+    # 청크 크기 설정 (커맨드 라인 인자나 환경 변수로 조정 가능)
+    import sys
+    if len(sys.argv) > 1:
+        try:
+            chunk_size = int(sys.argv[1])
+            print(f"📋 사용자 지정 청크 크기: {chunk_size:,}행")
+        except ValueError:
+            chunk_size = 100000
+            print("⚠️  잘못된 청크 크기입니다. 기본값을 사용합니다.")
     else:
-        chunk_size = 200000
-        print("🚀 큰 청크 크기로 빠르게 처리합니다.")
+        # 메모리에 따른 자동 청크 크기 조정
+        if available_memory_gb < 4:
+            chunk_size = 50000
+            print("⚠️  메모리가 부족합니다. 작은 청크 크기로 처리합니다.")
+        elif available_memory_gb < 8:
+            chunk_size = 100000
+            print("🔧 중간 청크 크기로 처리합니다.")
+        else:
+            chunk_size = 200000
+            print("🚀 큰 청크 크기로 빠르게 처리합니다.")
+
+    print(f"💾 청크 크기: {chunk_size:,}행")
 
     # 데이터 경로 설정
     train_path = 'data/train.parquet'
@@ -130,9 +308,17 @@ def main():
     os.makedirs('processed_data', exist_ok=True)
 
     try:
-        print("\n=== 1단계: 샘플 데이터로 전처리기 학습 ===")
+        print("\n=== 1단계: 전체 데이터 카테고리 스캔 ===")
+        # 전체 데이터의 카테고리 값들을 미리 스캔
+        scan_success = preprocessor.scan_categorical_values(train_path, chunk_size=chunk_size//2)
+
+        if not scan_success:
+            print("⚠️  카테고리 스캔 실패. 기본 방식으로 처리합니다.")
+
+        print("\n=== 2단계: 샘플 데이터로 전처리기 학습 ===")
         # 작은 샘플로 전처리기 학습 (인코더, 스케일러 등)
-        sample_df = pd.read_parquet(train_path, nrows=10000)
+        sample_df = pd.read_parquet(train_path)
+        sample_df = sample_df.head(10000)  # 첫 10000행만 사용
         print(f"샘플 데이터 로드: {sample_df.shape}")
 
         # 샘플로 전처리기 학습
@@ -148,7 +334,7 @@ def main():
         del sample_df, sample_processed
         gc.collect()
 
-        print("\n=== 2단계: 훈련 데이터 청크 처리 ===")
+        print("\n=== 3단계: 훈련 데이터 청크 처리 ===")
         # 전체 훈련 데이터 처리
         train_chunks = process_data_in_chunks(
             train_path,
@@ -158,7 +344,7 @@ def main():
             target_col='clicked'
         )
 
-        print("\n=== 3단계: 훈련 데이터 결합 및 분할 ===")
+        print("\n=== 4단계: 훈련 데이터 결합 및 분할 ===")
         # 청크 결합
         train_combined = combine_chunks_efficiently(train_chunks, 'processed_data/train_combined.parquet')
 
@@ -187,7 +373,7 @@ def main():
         del X, y
         gc.collect()
 
-        print("\n=== 4단계: 테스트 데이터 처리 ===")
+        print("\n=== 5단계: 테스트 데이터 처리 ===")
         X_test = None
         if test_path:
             test_chunks = process_data_in_chunks(
@@ -207,7 +393,7 @@ def main():
             del test_chunks
             gc.collect()
 
-        print("\n=== 5단계: 결과 저장 ===")
+        print("\n=== 6단계: 결과 저장 ===")
         save_files = [
             ("X_train", X_train),
             ("X_val", X_val),
@@ -232,7 +418,7 @@ def main():
                 except Exception as e:
                     print(f"{name} 저장 중 오류: {e}")
 
-        print("\n=== 6단계: 피처 정보 저장 ===")
+        print("\n=== 7단계: 피처 정보 저장 ===")
         # 피처 정보 저장
         feature_info = {
             'total_features': len(feature_cols),

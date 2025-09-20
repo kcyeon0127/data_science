@@ -22,8 +22,8 @@ data_science/
 │   └── *.csv                       # 통계 요약 데이터
 ├── 🔧 ctr_preprocessing.py         # 메인 전처리 클래스
 ├── 🛠️ preprocessing_utils.py       # 고급 유틸리티 함수
-├── ⚡ run_preprocessing.py         # 일반 실행 스크립트
-├── 💾 run_preprocessing_chunked.py # 메모리 효율적 실행
+├── 💾 checkpoint_manager.py        # 체크포인트 관리자
+├── ⚡ run_preprocessing.py         # 메인 실행 스크립트 (체크포인트 지원)
 ├── 🖥️ check_memory.py             # 시스템 리소스 체크
 ├── 📈 eda_ctr_polars.py           # EDA 분석 스크립트
 ├── 🎨 visualize_ctr.py            # 시각화 스크립트
@@ -51,19 +51,19 @@ python check_memory.py
 ### 4. 데이터 전처리 실행
 ```bash
 # 🚀 체크포인트 방식 (권장) - 중간 재시작 가능
-python run_preprocessing_checkpoint.py
-
-# 일반 방식 (8GB+ 메모리 권장)
 python run_preprocessing.py
 
-# 메모리 효율적 청크 방식 (자동 청크 크기)
-python run_preprocessing_chunked.py
+# 실패 후 재시작
+python run_preprocessing.py --resume
 
-# 청크 방식 + 수동 청크 크기 지정
-python run_preprocessing_chunked.py 100000
+# 전처리기 재학습
+python run_preprocessing.py --retrain
 
-# 간단한 방식 (메모리 부족 시)
-python run_preprocessing_simple.py
+# 청크 크기 조정
+python run_preprocessing.py --chunk-size 50000
+
+# 데이터 경로 지정
+python run_preprocessing.py --data-path data/train.parquet
 ```
 
 ### 3. 개별 전처리 사용법
@@ -112,97 +112,28 @@ train.parquet 크기: 8.21 GB
 전처리 방법 추천
 🟢 메모리 충분 (8GB 이상)
 권장 방법:
-  1. python run_preprocessing.py (빠름)
-  2. python run_preprocessing_chunked.py (안전)
+  1. python run_preprocessing.py (체크포인트)
+  2. python run_preprocessing.py --chunk-size 50000 (안전)
 ```
 
-### ⚡ 2. 일반 전처리 (`run_preprocessing.py`)
-```bash
-python run_preprocessing.py
-```
-**특징:**
-- 전체 데이터를 메모리에 로드
-- 빠른 처리 속도
-- 8GB+ 메모리 권장
-
-**진행률 표시:**
-```
-데이터 로딩: 100%|██████████| 2/2 [00:05<00:00]
-훈련 데이터 전처리: 83%|████████▎ | 5/6 [02:30<00:30] ✓ Categorical features encoded
-피처 중요도 분석: 100%|██████████| 3/3 [00:45<00:00] 중요도 계산 완료
-```
-
-### 💾 3. 청크 전처리 (`run_preprocessing_chunked.py`)
-
-#### 기본 사용법 (자동 청크 크기):
-```bash
-python run_preprocessing_chunked.py
-```
-
-#### 청크 크기 수동 지정:
-```bash
-# 50만 행씩 처리 (대용량 메모리)
-python run_preprocessing_chunked.py 500000
-
-# 20만 행씩 처리 (표준)
-python run_preprocessing_chunked.py 200000
-
-# 10만 행씩 처리 (중간)
-python run_preprocessing_chunked.py 100000
-
-# 5만 행씩 처리 (메모리 절약)
-python run_preprocessing_chunked.py 50000
-```
-
-**특징:**
-- 메모리 안전한 청크 단위 처리
-- 실시간 메모리 사용량 모니터링
-- 중간 저장으로 안정성 확보
-- 모든 시스템에서 사용 가능
-
-**진행률 표시:**
-```
-청크 처리 (100,000행씩): 67%|██████▋   | 67/100 [15:30<07:30] 청크 67/100, 메모리: 45.2MB
-```
-
-**권장 청크 크기:**
-| 시스템 메모리 | 권장 청크 크기 | 명령어 |
-|---------------|----------------|---------|
-| 16GB+         | 500,000행      | `python run_preprocessing_chunked.py 500000` |
-| 8-16GB        | 200,000행      | `python run_preprocessing_chunked.py 200000` |
-| 4-8GB         | 100,000행      | `python run_preprocessing_chunked.py 100000` |
-| 4GB 미만      | 50,000행       | `python run_preprocessing_chunked.py 50000` |
-
-### 🔧 4. 간단 전처리 (`run_preprocessing_simple.py`)
-```bash
-python run_preprocessing_simple.py
-```
-**특징:**
-- 메모리 적응형 처리
-- 메모리 부족 시 자동으로 샘플 데이터로 전환
-- 데이터 타입 자동 최적화
-- 가장 안전한 방식
-
-**메모리별 동작:**
-- **4GB 미만**: 10만 행 샘플로 처리
-- **4-8GB**: 50만 행으로 제한
-- **8GB+**: 전체 데이터 처리
-
-### 🔄 5. 체크포인트 전처리 (`run_preprocessing_checkpoint.py`) ⭐ **권장**
+### ⚡ 2. 체크포인트 전처리 (`run_preprocessing.py`) ⭐ **권장**
 
 #### 기본 사용법:
 ```bash
 # 처음 시작
-python run_preprocessing_checkpoint.py
+python run_preprocessing.py
 
 # 중간에 실패했을 때 재시작
-python run_preprocessing_checkpoint.py --resume
+python run_preprocessing.py --resume
 
 # 전처리기 재학습
-python run_preprocessing_checkpoint.py --retrain
+python run_preprocessing.py --retrain
 
 # 청크 크기 조정
-python run_preprocessing_checkpoint.py --chunk-size 50000
+python run_preprocessing.py --chunk-size 50000
+
+# 데이터 경로 지정
+python run_preprocessing.py --data-path data/train.parquet
 ```
 
 #### 체크포인트 시스템 특징:
@@ -215,7 +146,7 @@ python run_preprocessing_checkpoint.py --chunk-size 50000
 
 **1️⃣ 첫 실행:**
 ```bash
-python run_preprocessing_checkpoint.py --chunk-size 100000
+python run_preprocessing.py --chunk-size 100000
 ```
 ```
 1단계: 카테고리 스캔 → checkpoints/preprocessor.pkl 저장
@@ -233,7 +164,7 @@ python run_preprocessing_checkpoint.py --chunk-size 100000
 
 **3️⃣ 재시작:**
 ```bash
-python run_preprocessing_checkpoint.py --resume
+python run_preprocessing.py --resume
 ```
 ```
 📂 기존 전처리기 로드 (카테고리 스캔 생략)
@@ -253,30 +184,30 @@ python run_preprocessing_checkpoint.py --resume
 **시나리오 1: 안전한 대용량 처리**
 ```bash
 # 작은 청크로 안전하게 시작
-python run_preprocessing_checkpoint.py --chunk-size 25000
+python run_preprocessing.py --chunk-size 25000
 
 # 메모리 여유가 있다면 큰 청크로 재시작
-python run_preprocessing_checkpoint.py --chunk-size 100000 --retrain
+python run_preprocessing.py --chunk-size 100000 --retrain
 ```
 
 **시나리오 2: 실패 후 복구**
 ```bash
 # 실행 중 killed 발생
-python run_preprocessing_checkpoint.py --chunk-size 100000
+python run_preprocessing.py --chunk-size 100000
 # 💥 청크 23에서 메모리 부족
 
 # 더 작은 청크로 재시작
-python run_preprocessing_checkpoint.py --resume --chunk-size 50000
+python run_preprocessing.py --resume --chunk-size 50000
 # ✅ 청크 23부터 안전하게 재시작
 ```
 
 **시나리오 3: 전처리기 수정 후 재처리**
 ```bash
 # 코드 수정 후 전처리기 재학습
-python run_preprocessing_checkpoint.py --retrain
+python run_preprocessing.py --retrain
 
 # 기존 청크는 유지하고 전처리기만 재학습
-python run_preprocessing_checkpoint.py --retrain --resume
+python run_preprocessing.py --retrain --resume
 ```
 
 #### 생성되는 파일 구조:
@@ -471,21 +402,20 @@ report = utils.generate_preprocessing_report(original_df, processed_df)
 | 상황 | 추천 명령어 | 설명 |
 |------|-------------|------|
 | **첫 실행** | `python check_memory.py` | 시스템 체크 먼저 |
-| **⭐ 대부분 상황** | `python run_preprocessing_checkpoint.py` | 체크포인트 방식 (권장) |
-| **실패 후 재시작** | `python run_preprocessing_checkpoint.py --resume` | 중간부터 재개 |
-| **메모리 16GB+** | `python run_preprocessing.py` | 빠른 일반 처리 |
-| **메모리 8-16GB** | `python run_preprocessing_checkpoint.py --chunk-size 100000` | 중간 청크 |
-| **메모리 4-8GB** | `python run_preprocessing_checkpoint.py --chunk-size 50000` | 작은 청크 |
-| **메모리 4GB 미만** | `python run_preprocessing_checkpoint.py --chunk-size 25000` | 매우 작은 청크 |
-| **빠른 테스트** | `python run_preprocessing_simple.py` | 빠른 확인 |
+| **⭐ 대부분 상황** | `python run_preprocessing.py` | 체크포인트 방식 (권장) |
+| **실패 후 재시작** | `python run_preprocessing.py --resume` | 중간부터 재개 |
+| **메모리 16GB+** | `python run_preprocessing.py --chunk-size 200000` | 큰 청크 |
+| **메모리 8-16GB** | `python run_preprocessing.py --chunk-size 100000` | 중간 청크 |
+| **메모리 4-8GB** | `python run_preprocessing.py --chunk-size 50000` | 작은 청크 |
+| **메모리 4GB 미만** | `python run_preprocessing.py --chunk-size 25000` | 매우 작은 청크 |
 
 ### ⚡ 처리 방식 비교
 
 | 방식 | 속도 | 메모리 사용 | 안정성 | 권장 대상 |
 |------|------|-------------|--------|-----------|
-| **일반** (`run_preprocessing.py`) | 빠름 | 높음 (8GB+) | 보통 | 고성능 시스템 |
-| **청크** (`run_preprocessing_chunked.py`) | 보통 | 낮음-중간 | 높음 | 모든 시스템 (권장) |
-| **간단** (`run_preprocessing_simple.py`) | 빠름 | 낮음 | 높음 | 메모리 부족 시 |
+| **체크포인트** (`run_preprocessing.py`) | 보통 | 낮음-중간 | 매우 높음 | 모든 시스템 (권장) |
+| **일반 청크** | 빠름 | 높음 (8GB+) | 보통 | 고성능 시스템 |
+| **작은 청크** | 느림 | 낮음 | 높음 | 메모리 부족 시 |
 
 **v2.0 주요 개선사항:**
 - ✅ 하이브리드 카테고리 인코딩 (One-Hot + LabelEncoder)
@@ -587,6 +517,32 @@ pip install --upgrade pandas numpy scikit-learn tqdm psutil
 4. **스케일링**: RobustScaler로 이상치 영향 최소화
 
 ## 📝 변경 로그
+
+### v3.0 (2025-01-19) - 코드 구조 개선
+**🔄 주요 변경사항:**
+- **파일 구조 단순화**: 불필요한 스크립트 제거 및 통합
+- **체크포인트 관리자 분리**: `checkpoint_manager.py` 독립 모듈 생성
+- **단일 실행 스크립트**: `run_preprocessing.py` 하나로 통합
+
+**📁 파일 구조 변경:**
+```python
+# v2.0 (기존)
+├── run_preprocessing.py
+├── run_preprocessing_chunked.py
+├── run_preprocessing_safe.py
+├── run_preprocessing_simple.py
+├── run_preprocessing_checkpoint.py
+
+# v3.0 (개선)
+├── ctr_preprocessing.py        # 전처리 클래스
+├── checkpoint_manager.py       # 체크포인트 관리
+├── run_preprocessing.py        # 통합 실행 스크립트
+```
+
+**🎯 사용자 영향:**
+- 더 간단한 사용법 (하나의 스크립트만 기억)
+- 명령어 옵션으로 모든 기능 제어
+- 기존 기능 100% 유지
 
 ### v2.0 (2025-01-18) - 하이브리드 카테고리 인코딩
 **🔄 주요 변경사항:**

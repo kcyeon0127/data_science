@@ -56,6 +56,17 @@ ENV/
 *.swp
 *.swo
 
-# 결과 출력 파일들 (필요시 주석 해제)
-# out_eda/*.csv
-# processed_data/*.json
+# 결과 출력 파일들
+submission_*.csv
+out_eda/*.csv
+processed_data/*.json
+
+# 체크포인트 폴더들
+checkpoints/
+checkpoints_backup_*/
+batch_data/
+
+# 대용량 결과 파일
+*.csv
+!sample_submission.csv
+!*README*.csv

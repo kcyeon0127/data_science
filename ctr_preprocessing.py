@@ -302,36 +302,55 @@ class CTRDataPreprocessor:
         return df
 
     def preprocess_pipeline(self, df, is_training=True, target_col='clicked', pbar=None):
-        """Complete preprocessing pipeline"""
+        """Complete preprocessing pipeline with memory management"""
+        import gc
         print(f"Starting preprocessing... Shape: {df.shape}")
 
         # 1. Handle missing values
-        df = self.handle_missing_values(df)
+        df_new = self.handle_missing_values(df)
+        del df
+        df = df_new
+        gc.collect()
         print("✓ Missing values handled")
         if pbar: pbar.update(1)
 
         # 2. Feature engineering
-        df = self.engineer_features(df)
+        df_new = self.engineer_features(df)
+        del df
+        df = df_new
+        gc.collect()
         print("✓ Feature engineering completed")
         if pbar: pbar.update(1)
 
         # 3. Target encoding
-        df = self.create_target_encoding(df, target_col, is_training)
+        df_new = self.create_target_encoding(df, target_col, is_training)
+        del df
+        df = df_new
+        gc.collect()
         print("✓ Target encoding completed")
         if pbar: pbar.update(1)
 
         # 4. Handle outliers
-        df = self.handle_outliers(df)
+        df_new = self.handle_outliers(df)
+        del df
+        df = df_new
+        gc.collect()
         print("✓ Outliers handled")
         if pbar: pbar.update(1)
 
         # 5. Encode categorical features
-        df = self.encode_categorical_features(df, is_training)
+        df_new = self.encode_categorical_features(df, is_training)
+        del df
+        df = df_new
+        gc.collect()
         print("✓ Categorical features encoded")
         if pbar: pbar.update(1)
 
         # 6. Scale numeric features
-        df = self.scale_numeric_features(df, is_training)
+        df_new = self.scale_numeric_features(df, is_training)
+        del df
+        df = df_new
+        gc.collect()
         print("✓ Numeric features scaled")
         if pbar: pbar.update(1)
 

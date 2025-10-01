@@ -19,6 +19,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+import xgboost as xgb
 from tqdm.auto import tqdm
 
 MAX_SEQ_LEN = 128
@@ -206,7 +207,7 @@ class AttentionCTRNet(nn.Module):
             nn.Linear(embed_dim // 2, 1),
         )
 
-    def forward(self, numeric, cats, seqs, seq_lengths):
+    def forward(self, numeric, cats, seqs, seq_lengths, return_repr: bool = False):
         batch_size = cats[0].size(0) if cats else numeric.size(0)
 
         tokens = []
@@ -254,6 +255,8 @@ class AttentionCTRNet(nn.Module):
         tokens = self.ffn(tokens) + tokens
         cls_repr = tokens[:, 0, :]
         logits = self.head(cls_repr).squeeze(-1)
+        if return_repr:
+            return logits, cls_repr
         return logits
 
 
@@ -539,6 +542,71 @@ class MacXGBoostAttention:
         return ap, wll
 
     @torch.no_grad()
+    def generate_embeddings(
+        self,
+        model: nn.Module,
+        df: pd.DataFrame,
+        numeric_cols: List[str],
+        batch_size: int = 2048,
+    ) -> np.ndarray:
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+        dataset = CTRDataset(df, numeric_cols, self.categorical_cols, self.seq_col)
+        pin = torch.cuda.is_available()
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            pin = False
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_eval,
+            pin_memory=pin,
+        )
+
+        model = model.to(device)
+        model.eval()
+        embeddings = np.zeros((len(dataset), model.embed_dim), dtype=np.float32)
+        offset = 0
+
+        for numeric, cats, seqs, seq_len, _ in tqdm(loader, desc="임베딩 추출", leave=False):
+            numeric = numeric.to(device)
+            cats = [cats[:, i].to(device) for i in range(cats.size(1))] if cats.size(1) > 0 else []
+            seqs = seqs.to(device)
+            seq_len = seq_len.to(device)
+            _, cls_repr = model(numeric, cats, seqs, seq_len, return_repr=True)
+            batch_emb = cls_repr.cpu().numpy()
+            embeddings[offset : offset + batch_emb.shape[0]] = batch_emb
+            offset += batch_emb.shape[0]
+
+        return embeddings
+
+    def append_attention_embeddings(self, model: nn.Module) -> None:
+        print("\n🔗 5) Attention 임베딩 생성...")
+        base_numeric_cols = list(self.numeric_cols)
+        train_emb = self.generate_embeddings(model, self.train_df, base_numeric_cols)
+        test_emb = self.generate_embeddings(model, self.test_df, base_numeric_cols)
+
+        embed_cols = [f"attn_emb_{i}" for i in range(train_emb.shape[1])]
+        for idx, col in enumerate(embed_cols):
+            self.train_df[col] = train_emb[:, idx].astype(np.float32)
+            self.test_df[col] = test_emb[:, idx].astype(np.float32)
+
+        self.numeric_cols.extend(embed_cols)
+        self.numeric_cols = list(dict.fromkeys(self.numeric_cols))
+
+        model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    @torch.no_grad()
     def predict(self, model: nn.Module, batch_size: int = 4096) -> np.ndarray:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
@@ -580,6 +648,83 @@ class MacXGBoostAttention:
 
         return np.concatenate(all_preds)
 
+    def train_xgboost_with_embeddings(self) -> np.ndarray:
+        print("\n🌲 6) XGBoost 학습 및 예측 시작")
+
+        feature_cols = self.numeric_cols + self.categorical_cols
+        X = self.train_df[feature_cols]
+        y = self.train_df["clicked"]
+
+        pos_ratio = y.mean()
+        scale_pos_weight = (1 - pos_ratio) / pos_ratio
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=42,
+            stratify=y,
+        )
+
+        tree_method = "gpu_hist" if torch.cuda.is_available() else "hist"
+
+        model_configs = {
+            "xgb_fast": {
+                "max_depth": 6,
+                "learning_rate": 0.1,
+                "n_estimators": 500,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "scale_pos_weight": scale_pos_weight,
+                "random_state": 42,
+                "n_jobs": -1,
+            },
+            "xgb_deep": {
+                "max_depth": 8,
+                "learning_rate": 0.05,
+                "n_estimators": 800,
+                "subsample": 0.9,
+                "colsample_bytree": 0.9,
+                "scale_pos_weight": scale_pos_weight,
+                "random_state": 42,
+                "n_jobs": -1,
+            },
+        }
+
+        test_preds = []
+        for name, params in model_configs.items():
+            print(f"\n🌳 {name} 학습 중...")
+            cfg = params.copy()
+            n_estimators = cfg.pop("n_estimators")
+            booster = xgb.XGBClassifier(
+                objective="binary:logistic",
+                tree_method=tree_method,
+                eval_metric="aucpr",
+                n_estimators=n_estimators,
+                enable_categorical=False,
+                **cfg,
+            )
+            booster.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False,
+                early_stopping_rounds=20,
+            )
+            val_pred = booster.predict_proba(X_val)[:, 1]
+            ap = average_precision_score(y_val, val_pred)
+            wll = compute_weighted_logloss(y_val.values, val_pred)
+            blended = 0.5 * ap + 0.5 * (1 - wll)
+            print(
+                f"   📊 Val AP: {ap:.4f} | Val WLL: {wll:.4f} | Blended: {blended:.4f}"
+            )
+
+            test_pred = booster.predict_proba(self.test_df[feature_cols])[:, 1]
+            test_preds.append(test_pred)
+
+        final_pred = np.mean(test_preds, axis=0)
+        return final_pred
+
     # ------------------------------------------------------------------
     # 전체 파이프라인
     # ------------------------------------------------------------------
@@ -606,14 +751,15 @@ class MacXGBoostAttention:
         if model is None:
             return
 
-        print("\n🎯 5) 테스트 예측 시작")
-        preds = self.predict(model)
+        self.append_attention_embeddings(model)
+
+        preds = self.train_xgboost_with_embeddings()
         submission = self._build_submission(preds)
         path = "submission_mac_xgboost_atten.csv"
         submission.to_csv(path, index=False)
         elapsed = time.time() - start
 
-        print("\n🎉 6) 파이프라인 완료")
+        print("\n🎉 7) 파이프라인 완료")
         print(f"⏱️ 총 소요 시간: {elapsed/60:.1f}분")
         print(f"📁 제출 파일: {path}")
 

@@ -441,7 +441,6 @@ class MacXGBoostAttention:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
         elif torch.cuda.is_available():
-            torch.cuda.set_device(3)
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
@@ -544,7 +543,6 @@ class MacXGBoostAttention:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
         elif torch.cuda.is_available():
-            torch.cuda.set_device(3)
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")

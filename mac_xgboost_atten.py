@@ -21,6 +21,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from tqdm.auto import tqdm
 
+MAX_SEQ_LEN = 128
+
 warnings.filterwarnings("ignore")
 
 try:
@@ -57,11 +59,23 @@ def compute_weighted_logloss(y_true: np.ndarray, y_pred: np.ndarray, eps: float 
     return float(loss.sum() / denom)
 
 
-def pad_sequences(sequences: List[np.ndarray]):
-    max_len = max(len(seq) for seq in sequences)
-    padded = np.zeros((len(sequences), max_len), dtype=np.float32)
-    lengths = np.zeros(len(sequences), dtype=np.int64)
-    for i, seq in enumerate(sequences):
+def pad_sequences(sequences: List[np.ndarray], max_len: int = MAX_SEQ_LEN):
+    trimmed = []
+    for seq in sequences:
+        if len(seq) == 0:
+            trimmed.append(np.zeros(1, dtype=np.float32))
+            continue
+        if len(seq) > max_len:
+            seq = seq[-max_len:]
+        trimmed.append(seq)
+
+    if not trimmed:
+        return np.zeros((0, max_len), dtype=np.float32), np.zeros(0, dtype=np.int64)
+
+    cur_max = max(len(seq) for seq in trimmed)
+    padded = np.zeros((len(trimmed), cur_max), dtype=np.float32)
+    lengths = np.zeros(len(trimmed), dtype=np.int64)
+    for i, seq in enumerate(trimmed):
         length = len(seq)
         padded[i, :length] = seq
         lengths[i] = length
@@ -251,6 +265,7 @@ class MacXGBoostAttention:
         self.categorical_cols: List[str] = []
         self.cardinalities: List[int] = []
         self.seq_col: Optional[str] = "seq"
+        self.max_seq_len: int = MAX_SEQ_LEN
         print("🍎 Attention CTR 파이프라인 초기화 완료")
 
     # ------------------------------------------------------------------
@@ -299,6 +314,7 @@ class MacXGBoostAttention:
             self.train_df[self.seq_col] = self.train_df[self.seq_col].fillna("")
             if self.seq_col in self.test_df.columns:
                 self.test_df[self.seq_col] = self.test_df[self.seq_col].fillna("")
+            print(f"   ↪ 시퀀스 길이 최대 {self.max_seq_len} 토큰으로 제한")
 
         print("✅ 데이터 로딩 완료")
         print(f"   Train: {self.train_df.shape}")
@@ -384,8 +400,8 @@ class MacXGBoostAttention:
         embed_dim: int = 64,
         num_heads: int = 4,
         dropout: float = 0.2,
-        batch_size: int = 2048,
-        max_epochs: int = 20,
+        batch_size: int = 1024,
+        max_epochs: int = 15,
         patience: int = 3,
         lr: float = 3e-4,
     ) -> Optional[nn.Module]:
@@ -425,6 +441,7 @@ class MacXGBoostAttention:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
         elif torch.cuda.is_available():
+            torch.cuda.set_device(3)
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
@@ -527,6 +544,7 @@ class MacXGBoostAttention:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
         elif torch.cuda.is_available():
+            torch.cuda.set_device(3)
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")

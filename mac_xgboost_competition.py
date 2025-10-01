@@ -11,8 +11,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score
+try:
+    import pyarrow.parquet as pq
+except ImportError:  # pyarrow is optional for batch loading
+    pq = None
 import xgboost as xgb
 from tqdm.auto import tqdm
 import gc
@@ -26,6 +30,7 @@ class MacXGBoostCTR:
         self.models = {}
         self.encoders = {}
         self.feature_cols = []
+        self.additional_numeric_cols = []
         print("🍎 Mac용 XGBoost CTR 초기화 완료")
 
     @staticmethod
@@ -61,6 +66,32 @@ class MacXGBoostCTR:
 
     # Tell XGBoost to log a friendly metric name when using the sklearn wrapper.
     blended_eval_metric.__name__ = 'ap50_wll50'
+
+    @staticmethod
+    def blended_eval_metric_to_minimize(y_true, y_pred):
+        """Inverted blended metric so XGBoost can minimize it during training."""
+        return 1.0 - MacXGBoostCTR.blended_eval_metric(y_true, y_pred)
+
+    blended_eval_metric_to_minimize.__name__ = 'ap50_wll50_inv'
+
+    @staticmethod
+    def optimize_chunk_memory(df: pd.DataFrame) -> pd.DataFrame:
+        """Downcast numeric columns to reduce memory footprint during batching."""
+        for col in df.select_dtypes(include=['float64']).columns:
+            df[col] = df[col].astype('float32')
+        for col in df.select_dtypes(include=['int64']).columns:
+            df[col] = pd.to_numeric(df[col], downcast='integer')
+        return df
+
+    @staticmethod
+    def xgb_blended_feval(preds, dmatrix):
+        """Custom evaluation for xgboost.train using blended AP/WLL."""
+        labels = dmatrix.get_label()
+        proba = preds
+        if np.any((proba < 0) | (proba > 1)):
+            proba = 1.0 / (1.0 + np.exp(-proba))
+        score = MacXGBoostCTR.blended_eval_metric(labels, proba)
+        return 'ap50_wll50', score
 
     def load_data_efficiently(self, sample_ratio=0.3, use_batch=False):
         """효율적 데이터 로딩 (배치 처리 옵션 포함)"""
@@ -120,45 +151,89 @@ class MacXGBoostCTR:
 
         return True
 
+    def add_target_encoding_features(self, columns=None, prior=50):
+        """Add smoothed target-encoding and frequency features for categorical columns."""
+        if columns is None:
+            columns = ['inventory_id', 'gender', 'age_group']
+
+        available_cols = [col for col in columns if col in self.train_df.columns]
+        if not available_cols:
+            return
+
+        print("\n🎯 타깃 인코딩 기반 파생 특성 생성...")
+        global_mean = self.train_df['clicked'].mean()
+
+        for col in tqdm(available_cols, desc="타깃 인코딩"):
+            tqdm.write(f"   ➕ {col} 처리 중...")
+            te_col = f"{col}_ctr_te"
+            count_col = f"{col}_count"
+
+            stats = self.train_df.groupby(col)['clicked'].agg(['sum', 'count'])
+            ctr_map_full = (stats['sum'] + global_mean * prior) / (stats['count'] + prior)
+            count_map_full = stats['count']
+
+            sum_map = self.train_df[col].map(stats['sum'])
+            count_map = self.train_df[col].map(stats['count'])
+            numerator = sum_map - self.train_df['clicked'] + global_mean * prior
+            denominator = count_map - 1 + prior
+            self.train_df[te_col] = (numerator / denominator).fillna(global_mean)
+            self.train_df[count_col] = count_map.fillna(0)
+
+            if col in self.test_df.columns:
+                self.test_df[te_col] = self.test_df[col].map(ctr_map_full).fillna(global_mean)
+                self.test_df[count_col] = self.test_df[col].map(count_map_full).fillna(0)
+            else:
+                self.test_df[te_col] = global_mean
+                self.test_df[count_col] = 0
+
+            self.train_df[te_col] = self.train_df[te_col].astype(np.float32, copy=False)
+            self.test_df[te_col] = self.test_df[te_col].astype(np.float32, copy=False)
+            self.train_df[count_col] = self.train_df[count_col].astype(np.float32, copy=False)
+            self.test_df[count_col] = self.test_df[count_col].astype(np.float32, copy=False)
+
+            for new_col in (te_col, count_col):
+                if new_col not in self.additional_numeric_cols:
+                    self.additional_numeric_cols.append(new_col)
+
+        gc.collect()
+
     def load_data_in_batches(self, file_path, batch_size=500000):
-        """배치별로 안전하게 데이터 로딩 (간단한 방식)"""
+        """배치별로 안전하게 데이터 로딩 (pyarrow 기반)"""
         print(f"📦 배치 크기 {batch_size:,}행으로 안전 로딩...")
 
+        if pq is None:
+            print("⚠️ pyarrow가 없어 일반 로딩으로 전환합니다 (메모리 주의)")
+            return pd.read_parquet(file_path)
+
         try:
-            # 먼저 전체 로드 시도
-            print("   전체 로드 시도 중...")
-            full_df = pd.read_parquet(file_path)
-            print(f"✅ 전체 로드 성공: {full_df.shape}")
-            return full_df
+            parquet_file = pq.ParquetFile(file_path)
+            batches = []
+            total_rows = 0
 
-        except MemoryError:
-            print("   메모리 부족! 샘플링으로 전환...")
+            for idx, batch in enumerate(parquet_file.iter_batches(batch_size=batch_size), start=1):
+                chunk_df = batch.to_pandas()
+                chunk_df = self.optimize_chunk_memory(chunk_df)
+                batches.append(chunk_df)
+                total_rows += len(chunk_df)
 
-            # 메모리 부족 시 70% 샘플링으로 폴백
-            full_df = pd.read_parquet(file_path)
-            clicked = full_df[full_df['clicked'] == 1]
-            not_clicked = full_df[full_df['clicked'] == 0]
+                if idx % 5 == 0:
+                    print(f"   ✅ {total_rows:,}행 누적 로딩 완료")
 
-            # 70% 샘플링
-            sample_ratio = 0.7
-            n_clicked = int(len(clicked) * sample_ratio)
-            n_not_clicked = int(len(not_clicked) * sample_ratio)
+            if not batches:
+                print("⚠️ 배치 로드 결과가 비어 있습니다")
+                return pd.DataFrame()
 
-            sample_clicked = clicked.sample(min(len(clicked), n_clicked), random_state=42)
-            sample_not_clicked = not_clicked.sample(min(len(not_clicked), n_not_clicked), random_state=42)
-
-            result_df = pd.concat([sample_clicked, sample_not_clicked], ignore_index=True)
-
-            # 메모리 정리
-            del full_df, clicked, not_clicked, sample_clicked, sample_not_clicked
-            gc.collect()
-
-            print(f"✅ 샘플링 로드 완료: {result_df.shape}")
+            result_df = pd.concat(batches, ignore_index=True)
+            print(f"✅ 배치 로드 완료: {result_df.shape}")
             return result_df
 
+        except MemoryError:
+            print("❌ 여전히 메모리 부족! 70% 샘플링으로 폴백합니다")
+            full_df = pd.read_parquet(file_path)
+            return full_df.sample(frac=0.7, random_state=42)
+
         except Exception as e:
-            print(f"❌ 로딩 실패: {e}")
-            # 최후의 수단: 30% 샘플링
+            print(f"❌ 배치 로드 실패: {e}")
             print("   30% 샘플링으로 재시도...")
             full_df = pd.read_parquet(file_path)
             return full_df.sample(frac=0.3, random_state=42)
@@ -170,6 +245,10 @@ class MacXGBoostCTR:
         # 수치형 특성
         numeric_cols = [col for col in self.train_df.columns
                        if col.startswith(('feat_', 'history_', 'l_feat_'))]
+        extra_numeric = [col for col in self.additional_numeric_cols
+                         if col in self.train_df.columns]
+        # 순서를 보존하며 중복 제거
+        numeric_cols = list(dict.fromkeys(numeric_cols + extra_numeric))
 
         # 카테고리 특성
         categorical_cols = ['gender', 'age_group']
@@ -207,6 +286,14 @@ class MacXGBoostCTR:
         # 최종 특성 목록
         self.feature_cols = [col for col in numeric_cols + categorical_cols
                            if col in self.train_df.columns]
+
+        # 메모리 최적화를 위해 다운캐스팅
+        if numeric_cols:
+            self.train_df.loc[:, numeric_cols] = self.train_df[numeric_cols].astype(np.float32, copy=False)
+            self.test_df.loc[:, numeric_cols] = self.test_df[numeric_cols].astype(np.float32, copy=False)
+        if categorical_cols:
+            self.train_df.loc[:, categorical_cols] = self.train_df[categorical_cols].astype(np.int32, copy=False)
+            self.test_df.loc[:, categorical_cols] = self.test_df[categorical_cols].astype(np.int32, copy=False)
 
         print(f"✅ 전처리 완료: {len(self.feature_cols)}개 특성")
         return True
@@ -246,6 +333,36 @@ class MacXGBoostCTR:
         else:
             print("✅ 클릭률 분포 균등함")
 
+        # 원본 데이터프레임은 더 이상 필요 없으므로 해제
+        del X, y
+
+        # numpy로 캐스팅하여 DMatrix 생성 후 메모리 절약
+        X_train_np = X_train.to_numpy(dtype=np.float32, copy=True)
+        X_val_np = X_val.to_numpy(dtype=np.float32, copy=True)
+        y_train_np = y_train.to_numpy(dtype=np.float32, copy=True)
+        y_val_np = y_val.to_numpy(dtype=np.float32, copy=True)
+
+        QuantileDMatrix = getattr(xgb, 'QuantileDMatrix', None)
+        if QuantileDMatrix is not None:
+            try:
+                dtrain_full = QuantileDMatrix(X_train_np, label=y_train_np)
+                try:
+                    dval_full = QuantileDMatrix(X_val_np, label=y_val_np, reference=dtrain_full)
+                except TypeError:
+                    try:
+                        dval_full = QuantileDMatrix(X_val_np, label=y_val_np, ref=dtrain_full)
+                    except TypeError:
+                        dval_full = QuantileDMatrix(X_val_np, label=y_val_np)
+            except TypeError:
+                QuantileDMatrix = None
+        if QuantileDMatrix is None:
+            dtrain_full = xgb.DMatrix(X_train_np, label=y_train_np)
+            dval_full = xgb.DMatrix(X_val_np, label=y_val_np)
+
+        # 원본 DataFrame/Series 메모리 해제
+        del X_train, X_val, y_train, y_train_np, X_train_np, X_val_np
+        gc.collect()
+
         # 모델 설정들 (early stopping 포함)
         model_configs = {
             'xgb_fast': {
@@ -279,51 +396,51 @@ class MacXGBoostCTR:
         for name, params in model_configs.items():
             print(f"\n🔄 {name} 훈련 중...")
 
-            # Early stopping 파라미터를 생성자에 추가
-            params_with_early_stop = params.copy()
-            params_with_early_stop['enable_categorical'] = False  # 호환성
-            params_with_early_stop['eval_metric'] = [MacXGBoostCTR.blended_eval_metric]
+            train_params = params.copy()
+            num_boost_round = train_params.pop('n_estimators', 500)
+            train_params['enable_categorical'] = False
+            if 'n_jobs' in train_params:
+                train_params['nthread'] = train_params.pop('n_jobs')
+            train_params.setdefault('subsample', 0.8)
+            train_params.setdefault('colsample_bytree', 0.8)
+            train_params.setdefault('max_bin', 256)
 
-            model = xgb.XGBClassifier(**params_with_early_stop)
-
-            # 간단한 fit (새 버전 호환)
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                verbose=20,  # 20 라운드마다 출력
-                callbacks=[
-                    xgb.callback.EarlyStopping(
-                        rounds=20,
-                        metric_name='ap50_wll50',
-                        save_best=True,
-                        maximize=True
-                    )
-                ]
+            booster = xgb.train(
+                params=train_params,
+                dtrain=dtrain_full,
+                num_boost_round=num_boost_round,
+                evals=[(dtrain_full, 'train'), (dval_full, 'validation')],
+                custom_metric=MacXGBoostCTR.xgb_blended_feval,
+                maximize=True,
+                early_stopping_rounds=20,
+                verbose_eval=20
             )
 
-            # 검증 성능 평가
-            val_pred = model.predict_proba(X_val)[:, 1]
-            ap = average_precision_score(y_val, val_pred)
-            wll = self.compute_weighted_logloss(y_val, val_pred)
-            # Leaderboard blends AP↑ and WLL↓ equally, so flip WLL to a reward component.
+            best_iter = getattr(booster, 'best_iteration', None)
+            if best_iter is not None and best_iter >= 0:
+                booster_for_eval = booster[: best_iter + 1]
+            else:
+                booster_for_eval = booster
+
+            val_pred = booster_for_eval.predict(dval_full)
+            ap = average_precision_score(y_val_np, val_pred)
+            wll = self.compute_weighted_logloss(y_val_np, val_pred)
             blended_score = 0.5 * ap + 0.5 * (1 - wll)
 
-            # Best iteration 정보
-            try:
-                if hasattr(model, 'best_iteration') and model.best_iteration is not None:
-                    best_iter = model.best_iteration
-                    print(f"   ✅ Best iteration: {best_iter}")
-                else:
-                    best_iter = getattr(model, 'n_estimators', 'unknown')
-                    print(f"   ✅ Total iterations: {best_iter}")
-            except:
-                print(f"   ✅ 훈련 완료")
+            if best_iter is not None:
+                print(f"   ✅ Best iteration: {best_iter}")
+            else:
+                print(f"   ✅ 훈련 완료 (early stopping 미사용)")
 
             print(f"   📊 {name} Validation AP: {ap:.4f}")
             print(f"   📊 {name} Validation WLL: {wll:.4f}")
             print(f"   📊 {name} Validation Blended (50% AP, 50% WLL): {blended_score:.4f}")
 
-            self.models[name] = [model]  # 리스트로 감싸서 기존 코드와 호환
+            self.models[name] = [{'booster': booster_for_eval}]
+
+        # 학습에 사용된 중간 자원 정리
+        del dtrain_full, dval_full, y_val_np
+        gc.collect()
 
         print("✅ 모델 훈련 완료!")
 
@@ -332,6 +449,7 @@ class MacXGBoostCTR:
         print("\n🎯 예측 시작...")
 
         X_test = self.test_df[self.feature_cols]
+        dtest = xgb.DMatrix(X_test)
         all_predictions = []
 
         for name, fold_models in self.models.items():
@@ -339,7 +457,8 @@ class MacXGBoostCTR:
 
             fold_preds = []
             for i, model in enumerate(fold_models):
-                pred = model.predict_proba(X_test)[:, 1]
+                booster = model['booster']
+                pred = booster.predict(dtest)
                 fold_preds.append(pred)
                 print(f"   Fold {i+1} 완료")
 
@@ -382,12 +501,17 @@ class MacXGBoostCTR:
         if not self.load_data_efficiently(sample_ratio, use_batch):
             return False
 
+        # 1-1. 타깃 인코딩 기반 파생 특성 추가
+        self.add_target_encoding_features()
+
         # 2. 전처리
         if not self.preprocess_features():
             return False
 
         # 3. 모델 훈련
         self.train_xgboost_models()
+        self.train_df = None
+        gc.collect()
 
         # 4. 예측
         submission_path = self.predict_and_submit()

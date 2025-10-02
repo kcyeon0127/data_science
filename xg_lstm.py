@@ -56,8 +56,15 @@ print(f"Device: {DEVICE}")
 
 # ------------------------- 데이터 로딩 -------------------------
 print("데이터 로드 시작")
-train = pd.read_parquet("./train.parquet", engine="pyarrow")
-test = pd.read_parquet("./test.parquet", engine="pyarrow")
+train_path = "./train.parquet"
+test_path = "./test.parquet"
+if not os.path.exists(train_path):
+    train_path = "./data/train.parquet"
+if not os.path.exists(test_path):
+    test_path = "./data/test.parquet"
+
+train = pd.read_parquet(train_path, engine="pyarrow")
+test = pd.read_parquet(test_path, engine="pyarrow")
 print(f"Train shape: {train.shape}")
 print(f"Test shape: {test.shape}")
 print("데이터 로드 완료")

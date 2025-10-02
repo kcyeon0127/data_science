@@ -20,6 +20,7 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
+from xgboost import callback as xgb_callback
 from tqdm.auto import tqdm
 
 MAX_SEQ_LEN = 128
@@ -709,9 +710,22 @@ class MacXGBoostAttention:
                 y_train,
                 eval_set=[(X_val, y_val)],
                 verbose=False,
-                early_stopping_rounds=20,
+                callbacks=[
+                    xgb_callback.EarlyStopping(
+                        rounds=20,
+                        maximize=True,
+                        metric_name="aucpr",
+                        save_best=True,
+                    )
+                ],
             )
-            val_pred = booster.predict_proba(X_val)[:, 1]
+            best_iter = getattr(booster, "best_iteration", None)
+            if best_iter is not None and best_iter >= 0:
+                val_pred = booster.predict_proba(X_val, iteration_range=(0, best_iter + 1))[:, 1]
+                test_pred = booster.predict_proba(self.test_df[feature_cols], iteration_range=(0, best_iter + 1))[:, 1]
+            else:
+                val_pred = booster.predict_proba(X_val)[:, 1]
+                test_pred = booster.predict_proba(self.test_df[feature_cols])[:, 1]
             ap = average_precision_score(y_val, val_pred)
             wll = compute_weighted_logloss(y_val.values, val_pred)
             blended = 0.5 * ap + 0.5 * (1 - wll)
@@ -719,7 +733,6 @@ class MacXGBoostAttention:
                 f"   📊 Val AP: {ap:.4f} | Val WLL: {wll:.4f} | Blended: {blended:.4f}"
             )
 
-            test_pred = booster.predict_proba(self.test_df[feature_cols])[:, 1]
             test_preds.append(test_pred)
 
         final_pred = np.mean(test_preds, axis=0)

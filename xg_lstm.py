@@ -18,7 +18,6 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import xgboost as xgb
-from xgboost import callback as xgb_callback
 
 
 # ------------------------- 설정 -------------------------
@@ -375,9 +374,11 @@ train_emb = extract_embeddings(model, train, num_cols, cat_cols, SEQ_COL, CFG["B
 test_emb = extract_embeddings(model, test, num_cols, cat_cols, SEQ_COL, CFG["BATCH_SIZE"])
 
 embed_cols = [f"lstm_emb_{i}" for i in range(train_emb.shape[1])]
-for idx, col in enumerate(embed_cols):
-    train[col] = train_emb[:, idx]
-    test[col] = test_emb[:, idx]
+train_emb_df = pd.DataFrame(train_emb, columns=embed_cols, index=train.index)
+test_emb_df = pd.DataFrame(test_emb, columns=embed_cols, index=test.index)
+
+train = pd.concat([train, train_emb_df], axis=1)
+test = pd.concat([test, test_emb_df], axis=1)
 
 aug_num_cols = num_cols + embed_cols
 
@@ -427,14 +428,6 @@ xgb_model.fit(
     y_train,
     eval_set=[(X_val, y_val)],
     verbose=False,
-    callbacks=[
-        xgb_callback.EarlyStopping(
-            rounds=50,
-            metric_name="aucpr",
-            maximize=True,
-            save_best=True,
-        )
-    ],
 )
 
 best_iter = getattr(xgb_model, "best_iteration", None)
@@ -456,3 +449,10 @@ submit = pd.read_csv("./sample_submission.csv")
 submit["clicked"] = test_pred
 submit.to_csv("./submission_xg_lstm.csv", index=False)
 print("저장 완료 -> submission_xg_lstm.csv")
+xgb_model.fit(
+    X_train,
+    y_train,
+    eval_set=[(X_val, y_val)],
+    verbose=False,
+)
+best_iter = getattr(xgb_model, "best_iteration", None)

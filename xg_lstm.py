@@ -369,6 +369,15 @@ model = train_model(
     device=DEVICE,
 )
 
+checkpoint_path = "wd_lstm_checkpoint.pt"
+torch.save({
+    "model_state_dict": model.state_dict(),
+    "cfg": CFG,
+    "num_cols": num_cols,
+    "cat_cols": cat_cols,
+}, checkpoint_path)
+print(f"체크포인트 저장: {checkpoint_path}")
+
 print("임베딩 추출 시작")
 train_emb = extract_embeddings(model, train, num_cols, cat_cols, SEQ_COL, CFG["BATCH_SIZE"])
 test_emb = extract_embeddings(model, test, num_cols, cat_cols, SEQ_COL, CFG["BATCH_SIZE"])
@@ -446,7 +455,10 @@ print(f"Validation AP: {val_ap:.4f}")
 
 # ------------------------- 제출 -------------------------
 print("추론 완료, 제출 파일 생성")
-submit = pd.read_csv("./sample_submission.csv")
+submit_path = "./sample_submission.csv"
+if not os.path.exists(submit_path):
+    submit_path = "./data/sample_submission.csv"
+submit = pd.read_csv(submit_path)
 submit["clicked"] = test_pred
 submit.to_csv("./submission_xg_lstm.csv", index=False)
 print("저장 완료 -> submission_xg_lstm.csv")

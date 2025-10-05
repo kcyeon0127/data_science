@@ -393,8 +393,9 @@ if torch.cuda.is_available():
 print("XGBoost 학습 시작")
 
 feature_cols_final = aug_num_cols + cat_cols
-X = train[feature_cols_final]
+X = train[feature_cols_final].apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.float32)
 y = train[TARGET_COL]
+test_features = test[feature_cols_final].apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.float32)
 
 pos_ratio = y.mean()
 scale_pos_weight = (1 - pos_ratio) / pos_ratio
@@ -433,10 +434,10 @@ xgb_model.fit(
 best_iter = getattr(xgb_model, "best_iteration", None)
 if best_iter is not None and best_iter >= 0:
     val_pred = xgb_model.predict_proba(X_val, iteration_range=(0, best_iter + 1))[:, 1]
-    test_pred = xgb_model.predict_proba(test[feature_cols_final], iteration_range=(0, best_iter + 1))[:, 1]
+    test_pred = xgb_model.predict_proba(test_features, iteration_range=(0, best_iter + 1))[:, 1]
 else:
     val_pred = xgb_model.predict_proba(X_val)[:, 1]
-    test_pred = xgb_model.predict_proba(test[feature_cols_final])[:, 1]
+    test_pred = xgb_model.predict_proba(test_features)[:, 1]
 
 val_ap = average_precision_score(y_val, val_pred)
 val_wll = -(0.5 * np.log(val_pred + 1e-12) * y_val + 0.5 * np.log(1 - val_pred + 1e-12) * (1 - y_val)).mean()

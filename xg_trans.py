@@ -481,7 +481,7 @@ def extract_embeddings(
 
 # ------------------------- 파이프라인 -------------------------
 model = train_model(
-    train_df=train,
+    df=train,
     num_cols=num_cols,
     cat_cols=cat_cols,
     seq_col=SEQ_COL,

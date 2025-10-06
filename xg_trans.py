@@ -22,13 +22,15 @@ import xgboost as xgb
 
 CFG = {
     "BATCH_SIZE": 1024,
-    "EPOCHS": 5,
-    "LEARNING_RATE": 1e-3,
+    "EPOCHS": 10,
+    "LEARNING_RATE": 5e-4,
     "SEED": 42,
     "MAX_SEQ_LEN": 128,
     "D_MODEL": 64,
     "N_HEAD": 4,
     "N_LAYERS": 2,
+    "PATIENCE": 2,
+    "MAX_GRAD_NORM": 1.0,
 }
 
 
@@ -53,6 +55,24 @@ else:
     DEVICE = torch.device("cpu")
 
 print(f"Device: {DEVICE}")
+
+
+def compute_weighted_logloss(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-15) -> float:
+    y_pred = np.clip(y_pred, eps, 1 - eps)
+    pos_mask = y_true == 1
+    neg_mask = ~pos_mask
+    pos_count = pos_mask.sum()
+    neg_count = neg_mask.sum()
+    weights = np.zeros_like(y_pred, dtype=float)
+    if pos_count:
+        weights[pos_mask] = 0.5 / pos_count
+    if neg_count:
+        weights[neg_mask] = 0.5 / neg_count
+    loss = -weights * (y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+    denom = weights.sum()
+    if denom == 0:
+        return float(np.mean(loss))
+    return float(loss.sum() / denom)
 
 
 # ------------------------- 데이터 로딩 -------------------------
@@ -280,8 +300,72 @@ class CrossNetwork(nn.Module):
 
 
 # ------------------------- 학습 함수 -------------------------
+def create_dataloaders(
+    df: pd.DataFrame,
+    num_cols: List[str],
+    cat_cols: List[str],
+    seq_col: str,
+    target_col: str,
+    batch_size: int,
+):
+    train_df, val_df = train_test_split(
+        df,
+        test_size=0.1,
+        random_state=CFG["SEED"],
+        stratify=df[target_col],
+    )
+
+    train_dataset = ClickDataset(train_df.reset_index(drop=True), num_cols, cat_cols, seq_col, target_col)
+    val_dataset = ClickDataset(val_df.reset_index(drop=True), num_cols, cat_cols, seq_col, target_col)
+
+    pin = torch.cuda.is_available()
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        pin = False
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_fn_train,
+        pin_memory=pin,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn_train,
+        pin_memory=pin,
+    )
+
+    return train_loader, val_loader
+
+
+@torch.no_grad()
+def evaluate_model(model, loader, device):
+    model.eval()
+    preds, targets = [], []
+    for num_x, cat_x, seqs, lens, ys in loader:
+        num_x = num_x.to(device)
+        cat_x = cat_x.to(device)
+        seqs = seqs.to(device)
+        lens = lens.to(device)
+        ys = ys.to(device)
+        logits = model(num_x, cat_x, seqs, lens)
+        prob = torch.sigmoid(logits).cpu().numpy()
+        preds.append(prob)
+        targets.append(ys.cpu().numpy())
+
+    preds = np.concatenate(preds)
+    targets = np.concatenate(targets)
+    ap = average_precision_score(targets, preds)
+    wll = compute_weighted_logloss(targets, preds)
+    return ap, wll
+
+
 def train_model(
-    train_df: pd.DataFrame,
+    df: pd.DataFrame,
     num_cols: List[str],
     cat_cols: List[str],
     seq_col: str,
@@ -291,18 +375,7 @@ def train_model(
     lr: float,
     device: torch.device,
 ) -> TransformerCTR:
-    dataset = ClickDataset(train_df, num_cols, cat_cols, seq_col, target_col)
-    pin = torch.cuda.is_available()
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        pin = False
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn_train,
-        pin_memory=pin,
-    )
+    train_loader, val_loader = create_dataloaders(df, num_cols, cat_cols, seq_col, target_col, batch_size)
 
     cat_cardinalities = [len(cat_encoders[c].classes_) for c in cat_cols]
     model = TransformerCTR(
@@ -313,17 +386,20 @@ def train_model(
         n_layers=CFG["N_LAYERS"],
     ).to(device)
 
-    pos_weight_value = (len(train_df) - train_df[target_col].sum()) / train_df[target_col].sum()
+    pos_weight_value = (len(df) - df[target_col].sum()) / df[target_col].sum()
     pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=2, T_mult=2)
+
+    best_score = -np.inf
+    best_state = None
+    patience_counter = 0
 
     print("학습 시작")
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
-        for num_x, cat_x, seqs, lens, ys in tqdm(loader, desc=f"[Train Epoch {epoch}]"):
+        for num_x, cat_x, seqs, lens, ys in tqdm(train_loader, desc=f"[Train Epoch {epoch}]"):
             num_x = num_x.to(device)
             cat_x = cat_x.to(device)
             seqs = seqs.to(device)
@@ -334,14 +410,30 @@ def train_model(
             logits = model(num_x, cat_x, seqs, lens)
             loss = criterion(logits, ys)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["MAX_GRAD_NORM"])
             optimizer.step()
-            scheduler.step()
+
             total_loss += loss.item() * ys.size(0)
 
-        total_loss /= len(dataset)
-        print(f"[Epoch {epoch}] Train Loss: {total_loss:.4f}")
+        total_loss /= len(train_loader.dataset)
+        val_ap, val_wll = evaluate_model(model, val_loader, device)
+        blended = 0.5 * val_ap + 0.5 * (1 - val_wll)
+        print(f"[Epoch {epoch}] Train Loss: {total_loss:.4f} | Val AP: {val_ap:.4f} | Val WLL: {val_wll:.4f} | Blended: {blended:.4f}")
         if torch.cuda.is_available():
             print(f"   GPU Allocated: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+
+        if blended > best_score:
+            best_score = blended
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= CFG["PATIENCE"]:
+                print("⚠️ Early stopping triggered")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     print("학습 완료")
     return model

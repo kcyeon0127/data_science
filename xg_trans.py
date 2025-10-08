@@ -58,6 +58,7 @@ print(f"Device: {DEVICE}")
 
 
 def compute_weighted_logloss(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-15) -> float:
+    y_pred = np.nan_to_num(y_pred, nan=0.5, posinf=1 - eps, neginf=eps)
     y_pred = np.clip(y_pred, eps, 1 - eps)
     pos_mask = y_true == 1
     neg_mask = ~pos_mask
@@ -72,7 +73,10 @@ def compute_weighted_logloss(y_true: np.ndarray, y_pred: np.ndarray, eps: float 
     denom = weights.sum()
     if denom == 0:
         return float(np.mean(loss))
-    return float(loss.sum() / denom)
+    value = loss.sum() / denom
+    if not np.isfinite(value):
+        return float(np.nanmean(np.nan_to_num(loss, nan=0.0)))
+    return float(value)
 
 
 # ------------------------- 데이터 로딩 -------------------------
@@ -117,6 +121,106 @@ def encode_categoricals(train_df: pd.DataFrame, test_df: pd.DataFrame, cols: Lis
 
 
 train, test, cat_encoders = encode_categoricals(train, test, cat_cols)
+
+
+def add_sequence_features(train_df: pd.DataFrame, test_df: pd.DataFrame, seq_col: str) -> List[str]:
+    def build_features(df: pd.DataFrame) -> np.ndarray:
+        seq_values = df[seq_col].fillna("").astype(str).values
+        length = np.zeros(len(df), dtype=np.float32)
+        mean = np.zeros(len(df), dtype=np.float32)
+        std = np.zeros(len(df), dtype=np.float32)
+        last = np.zeros(len(df), dtype=np.float32)
+        recent_mean = np.zeros(len(df), dtype=np.float32)
+
+        window = min(10, CFG["MAX_SEQ_LEN"])
+
+        for idx, seq_str in enumerate(seq_values):
+            if seq_str:
+                arr = np.fromstring(seq_str, sep=",", dtype=np.float32)
+                if arr.size == 0:
+                    arr = np.zeros(1, dtype=np.float32)
+            else:
+                arr = np.zeros(1, dtype=np.float32)
+
+            if arr.size > CFG["MAX_SEQ_LEN"]:
+                arr = arr[-CFG["MAX_SEQ_LEN"]:]
+
+            length[idx] = arr.size
+            mean[idx] = arr.mean() if arr.size else 0.0
+            std[idx] = arr.std() if arr.size > 1 else 0.0
+            last[idx] = arr[-1] if arr.size else 0.0
+            recent_mean[idx] = arr[-window:].mean() if arr.size else 0.0
+
+        return np.vstack([length, mean, std, last, recent_mean]).T
+
+    cols = [
+        f"{seq_col}_length",
+        f"{seq_col}_mean",
+        f"{seq_col}_std",
+        f"{seq_col}_last",
+        f"{seq_col}_recent_mean",
+    ]
+
+    train_feats = build_features(train_df)
+    test_feats = build_features(test_df)
+
+    for i, col in enumerate(cols):
+        train_df[col] = train_feats[:, i]
+        test_df[col] = test_feats[:, i]
+
+    return cols
+
+
+def add_target_encoding_features(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    columns: List[str],
+    target_col: str,
+    prior: float = 50.0,
+    n_splits: int = 5,
+) -> List[str]:
+    from sklearn.model_selection import StratifiedKFold
+
+    global_mean = train_df[target_col].mean()
+    new_cols = []
+
+    for col in columns:
+        te_col = f"{col}_target_enc"
+        cnt_col = f"{col}_count"
+        new_cols.extend([te_col, cnt_col])
+
+        train_df[te_col] = 0.0
+        train_df[cnt_col] = 0.0
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=CFG["SEED"])
+        for train_idx, val_idx in skf.split(train_df[col], train_df[target_col]):
+            fold = train_df.iloc[train_idx]
+            stats = fold.groupby(col)[target_col].agg(["sum", "count"])
+            stats["te"] = (stats["sum"] + global_mean * prior) / (stats["count"] + prior)
+
+            val = train_df.iloc[val_idx]
+            train_df.loc[val.index, te_col] = val[col].map(stats["te"]).fillna(global_mean)
+            train_df.loc[val.index, cnt_col] = val[col].map(stats["count"]).fillna(0)
+
+        full_stats = train_df.groupby(col)[target_col].agg(["sum", "count"])
+        full_stats["te"] = (full_stats["sum"] + global_mean * prior) / (full_stats["count"] + prior)
+
+        test_df[te_col] = test_df[col].map(full_stats["te"]).fillna(global_mean)
+        test_df[cnt_col] = test_df[col].map(full_stats["count"]).fillna(0)
+
+    return new_cols
+
+
+sequence_feature_cols = add_sequence_features(train, test, SEQ_COL)
+target_encoding_cols = add_target_encoding_features(
+    train,
+    test,
+    columns=["inventory_id", "age_group", "gender"],
+    target_col=TARGET_COL,
+)
+
+num_cols.extend(sequence_feature_cols + target_encoding_cols)
+num_cols = list(dict.fromkeys(num_cols))
 
 
 # ------------------------- Dataset & Collate -------------------------

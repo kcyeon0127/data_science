@@ -267,9 +267,9 @@ def write_enriched_train(
                 float(np.mean(list(global_te_lookup[col].values()))),
             )
             df = df.merge(fold_tables[col], on=[col, "fold"], how="left")
-            df[f"{col}_te"].fillna(default_te, inplace=True)
+            df[f"{col}_te"] = df[f"{col}_te"].fillna(default_te)
             df = df.merge(count_tables[col], on=col, how="left")
-            df[f"{col}_cnt"].fillna(0.0, inplace=True)
+            df[f"{col}_cnt"] = df[f"{col}_cnt"].fillna(0.0)
             df[f"{col}_te"] = df[f"{col}_te"].astype(np.float32)
             df[f"{col}_cnt"] = df[f"{col}_cnt"].astype(np.float32)
             if f"{col}_te" not in summary_cols:

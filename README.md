@@ -30,6 +30,7 @@
 
 ## 📁 디렉터리 구조 (핵심)
 - `challenge_submission/`: 평가 정책 및 체크리스트, 모델 위치 안내.
+- `add_features.py`: train/test에 시퀀스 파생·타깃 인코딩 피처를 추가해 저장하는 스크립트.
 - `xg_lstm.py`: LSTM + XGBoost 하이브리드 모델.
 - `xg_trans.py`: Transformer + XGBoost 하이브리드 모델.
 - `mac_xgboost_competition.py`: 기본 XGBoost 베이스라인 스크립트.
@@ -39,7 +40,16 @@
 - LSTM/Transformer 모델 학습 후 체크포인트(`wd_lstm_checkpoint.pt`, `wd_transformer_checkpoint.pt`) 저장.
 - 제출 파일: `submission_mac_xgboost_competition.csv`, `submission_xg_lstm.csv`, `submission_xg_trans.csv`.
 
+## ⚙️ 최신 스크립트 및 추가 사항
+- `add_features.py`: train/test에 시퀀스 기반 파생 변수(길이/평균/표준편차/최근 평균 등)와 타깃 인코딩(`inventory_id`, `age_group`, `gender`)을 추가하고 `train_enriched.parquet`, `test_enriched.parquet`로 저장합니다.
+- `xg_trans.py`: 위에서 생성한 파생 피처를 포함해 Transformer + XGBoost 하이브리드 학습을 수행하며, 최근 Validation AP 약 0.082로 상승했습니다(제출 예시 `submission_xg_trans.csv`).
+- `tune_xg_lstm.py`: Optuna 기반으로 LSTM + XGBoost 모델의 하이퍼파라미터(배치 크기, epoch, 학습률 등)를 탐색합니다.
+- 제출 파일(예시):
+  * `submission_xg_lstm.csv`: 약 0.3447 AP (현재 최고)
+  * `submission_xg_trans.csv`: 약 0.3433 AP (Transformer 하이브리드)
+  * `submission_xg_trans_plus_param.csv`: 약 0.2669 AP (새 파생/튜닝 실험)
+
 ## 🚀 다음 단계 아이디어
 - Transformer/LSTM 임베딩을 LightGBM, CatBoost와 앙상블.
-- Optuna로 하이퍼파라미터 탐색.
+- Optuna를 적용해 더 넓은 하이퍼파라미터 탐색.
 - 시간 기반 validation, Hard negative sampling 등 추가 실험.

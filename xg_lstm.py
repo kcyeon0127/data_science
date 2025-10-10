@@ -55,12 +55,25 @@ print(f"Device: {DEVICE}")
 
 # ------------------------- 데이터 로딩 -------------------------
 print("데이터 로드 시작")
-train_path = "./train.parquet"
-test_path = "./test.parquet"
-if not os.path.exists(train_path):
-    train_path = "./data/train.parquet"
-if not os.path.exists(test_path):
-    test_path = "./data/test.parquet"
+
+def resolve_dataset(kind: str) -> str:
+    candidates = [
+        f"./{kind}_enriched.parquet",
+        f"./data/{kind}_enriched.parquet",
+        f"./{kind}.parquet",
+        f"./data/{kind}.parquet",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"{kind} parquet 파일을 찾을 수 없습니다: {candidates}")
+
+
+train_path = resolve_dataset("train")
+test_path = resolve_dataset("test")
+
+print(f"사용하는 학습 파일: {train_path}")
+print(f"사용하는 테스트 파일: {test_path}")
 
 train = pd.read_parquet(train_path, engine="pyarrow")
 test = pd.read_parquet(test_path, engine="pyarrow")
